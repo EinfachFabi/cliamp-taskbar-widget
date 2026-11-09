@@ -1,0 +1,13 @@
+[Unit]
+Description=cliamp Headless Music Player Daemon
+Documentation=https://github.com/bjarneo/cliamp
+After=sound.target pipewire.service pipewire-pulse.service pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env cliamp --daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

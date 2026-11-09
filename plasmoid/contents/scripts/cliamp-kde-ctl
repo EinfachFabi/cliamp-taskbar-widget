@@ -1,0 +1,986 @@
+#!/usr/bin/env python3
+"""
+cliamp-kde-ctl — Controller & IPC Bridge for the cliamp KDE Plasma Taskbar Integration.
+Provides fast JSON state snapshots, persistent volume & mute state,
+daemon lifecycle management, terminal launching, and full playback/EQ control.
+"""
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+EQ_PRESETS = [
+    "Flat",
+    "Rock",
+    "Pop",
+    "Jazz",
+    "Classical",
+    "Bass Boost",
+    "Treble Boost",
+    "Electronic",
+    "Vocal",
+    "Acoustic",
+    "Late Night",
+    "Hip-Hop",
+    "R&B",
+    "Loudness",
+    "Custom",
+]
+
+DEFAULT_PROVIDERS = [
+    {"key": "cliamp", "name": "cliamp Radio", "category": "radio", "icon": "radio", "description": "Curated synth, lofi, EDM & NCS streams"},
+    {"key": "radio", "name": "Internet Radio", "category": "radio", "icon": "network-wireless", "description": "Global online radio stations"},
+    {"key": "podcast", "name": "Podcasts", "category": "radio", "icon": "podcast", "description": "Podcast feeds & episodes"},
+    {"key": "local", "name": "Local Playlists", "category": "local", "icon": "folder-music", "description": "Saved local TOML playlists"},
+    {"key": "spotify", "name": "Spotify", "category": "cloud", "icon": "media-optical-audio", "description": "Spotify Connect / Librespot"},
+    {"key": "ytmusic", "name": "YouTube Music", "category": "cloud", "icon": "video-television", "description": "YouTube Music library & playlists"},
+    {"key": "soundcloud", "name": "SoundCloud", "category": "cloud", "icon": "cloud", "description": "SoundCloud tracks & sets"},
+    {"key": "bandcamp", "name": "Bandcamp", "category": "cloud", "icon": "album", "description": "Bandcamp collection & streams"},
+    {"key": "tidal", "name": "Tidal", "category": "cloud", "icon": "audio-x-flac", "description": "Tidal lossless streaming"},
+    {"key": "qobuz", "name": "Qobuz", "category": "cloud", "icon": "audio-x-generic", "description": "Qobuz hi-res streaming"},
+    {"key": "navidrome", "name": "Navidrome / Subsonic", "category": "cloud", "icon": "network-server", "description": "Self-hosted Subsonic/Navidrome server"},
+    {"key": "jellyfin", "name": "Jellyfin", "category": "cloud", "icon": "multimedia-player", "description": "Self-hosted Jellyfin media server"},
+    {"key": "plex", "name": "Plex", "category": "cloud", "icon": "multimedia-player", "description": "Plex music library"},
+]
+
+
+def get_cliamp_bin() -> str:
+    env_bin = os.environ.get("CLIAMP_BIN")
+    if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+        return env_bin
+
+    found = shutil.which("cliamp")
+    if found:
+        return found
+
+    extra_paths = [
+        Path.home() / ".local" / "bin" / "cliamp",
+        Path.home() / "go" / "bin" / "cliamp",
+        Path("/usr/local/bin/cliamp"),
+        Path("/usr/bin/cliamp"),
+    ]
+    for p in extra_paths:
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return "cliamp"
+
+
+def get_config_dir() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / "cliamp"
+    return Path.home() / ".config" / "cliamp"
+
+
+def get_socket_path() -> Path:
+    return get_config_dir() / "cliamp.sock"
+
+
+def get_kde_state_path() -> Path:
+    return get_config_dir() / "kde-state.json"
+
+
+def load_kde_state() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "volume_db": 0.0,
+        "pre_mute_volume_db": 0.0,
+        "muted": False,
+        "last_applied_pid": 0,
+    }
+    p = get_kde_state_path()
+    if p.is_file():
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                for k in defaults:
+                    if k in loaded:
+                        defaults[k] = loaded[k]
+        except Exception:
+            pass
+    return defaults
+
+
+def save_kde_state(state: Dict[str, Any]) -> None:
+    try:
+        cfg_dir = get_config_dir()
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        p = get_kde_state_path()
+        clean = {
+            "volume_db": state.get("volume_db", 0.0),
+            "pre_mute_volume_db": state.get("pre_mute_volume_db", 0.0),
+            "muted": bool(state.get("muted", False)),
+            "last_applied_pid": int(state.get("last_applied_pid", 0)),
+        }
+        p.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def clamp_vol(val: float) -> float:
+    return max(-30.0, min(6.0, round(float(val) * 2.0) / 2.0))
+
+
+def run_cliamp(args: List[str], timeout: float = 4.0) -> subprocess.CompletedProcess:
+    cmd = [get_cliamp_bin()] + args
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=str(exc))
+
+
+def detect_process_mode() -> Dict[str, Any]:
+    pids: List[int] = []
+    daemon_pids: List[int] = []
+    tui_pids: List[int] = []
+    try:
+        proc_dir = Path("/proc")
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == os.getpid():
+                continue
+            try:
+                cmdline_raw = (entry / "cmdline").read_bytes()
+                if not cmdline_raw:
+                    continue
+                parts = [p.decode("utf-8", errors="replace") for p in cmdline_raw.split(b"\x00") if p]
+                if not parts:
+                    continue
+                exe_name = os.path.basename(parts[0])
+                if exe_name != "cliamp":
+                    continue
+                subcommands = {
+                    "status", "remote", "play", "pause", "toggle", "next", "prev",
+                    "stop", "volume", "seek", "load", "queue", "theme", "vis",
+                    "visstream", "shuffle", "repeat", "mono", "speed", "eq",
+                    "device", "playlist", "plugins", "history", "help", "setup",
+                }
+                if any(arg in subcommands for arg in parts[1:]):
+                    continue
+                pids.append(pid)
+                if "-d" in parts[1:] or "--daemon" in parts[1:]:
+                    daemon_pids.append(pid)
+                else:
+                    tui_pids.append(pid)
+            except (PermissionError, FileNotFoundError, ProcessLookupError):
+                continue
+    except Exception:
+        pass
+
+    if daemon_pids:
+        mode = "daemon"
+    elif tui_pids:
+        mode = "tui"
+    else:
+        mode = "stopped"
+
+    return {
+        "mode": mode,
+        "pids": pids,
+        "daemon_pids": daemon_pids,
+        "tui_pids": tui_pids,
+    }
+
+
+def query_status_raw() -> Optional[Dict[str, Any]]:
+    sock = get_socket_path()
+    if not sock.exists():
+        return None
+    res = run_cliamp(["status", "--json"], timeout=2.0)
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        data = json.loads(res.stdout)
+        if isinstance(data, dict) and data.get("ok"):
+            return data
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+def query_remote_state() -> Optional[Dict[str, Any]]:
+    sock = get_socket_path()
+    if not sock.exists():
+        return None
+    res = run_cliamp(["remote", "state"], timeout=2.0)
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        data = json.loads(res.stdout)
+        if isinstance(data, dict) and data.get("ok"):
+            return data.get("snapshot", {})
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+def remote_call(operation: str, params: Optional[Dict[str, Any]] = None, wait: bool = True, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    args = ["remote", "call", operation]
+    if params is not None:
+        args.extend(["--params", json.dumps(params)])
+    if wait:
+        args.append("--wait")
+    res = run_cliamp(args, timeout=timeout)
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def get_local_playlists_offline() -> List[Dict[str, Any]]:
+    res = run_cliamp(["playlist", "list"], timeout=3.0)
+    playlists: List[Dict[str, Any]] = []
+    if res.returncode == 0 and res.stdout:
+        for line in res.stdout.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            m = re.match(r"^(.+?)\s+(\d+)\s+tracks?$", line_str)
+            if m:
+                name = m.group(1).strip()
+                count = int(m.group(2))
+                playlists.append({"id": name, "name": name, "provider": "local", "track_count": count})
+            else:
+                playlists.append({"id": line_str, "name": line_str, "provider": "local", "track_count": 0})
+    return playlists
+
+
+def build_status_snapshot() -> Dict[str, Any]:
+    installed = shutil.which(get_cliamp_bin()) is not None or os.path.isfile(get_cliamp_bin())
+    proc_info = detect_process_mode()
+    raw_status = query_status_raw()
+    remote_snap = query_remote_state() if raw_status else None
+    kstate = load_kde_state()
+
+    running = raw_status is not None
+    mode = proc_info["mode"]
+    if running and mode == "stopped":
+        mode = "daemon"
+
+    is_muted = bool(kstate.get("muted", False))
+    saved_vol = clamp_vol(-30.0 if is_muted else float(kstate.get("volume_db", 0.0)))
+
+    if not running:
+        return {
+            "ok": True,
+            "installed": installed,
+            "running": False,
+            "mode": "stopped",
+            "state": "stopped",
+            "track": {
+                "title": "",
+                "artist": "",
+                "album": "",
+                "path": "",
+                "duration": 0,
+                "stream": False,
+            },
+            "playlist": "",
+            "index": -1,
+            "total": 0,
+            "position": 0,
+            "duration": 0,
+            "seekable": False,
+            "volume": saved_vol,
+            "muted": is_muted,
+            "pre_mute_volume": float(kstate.get("pre_mute_volume_db", 0.0)),
+            "shuffle": False,
+            "repeat": "Off",
+            "mono": False,
+            "speed": 1.0,
+            "eq_preset": "Flat",
+            "eq_bands": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        }
+
+    # If a new cliamp process was started externally, apply saved volume to it once
+    current_pid = proc_info["pids"][0] if proc_info["pids"] else 0
+    if current_pid > 0 and kstate.get("last_applied_pid") != current_pid:
+        kstate["last_applied_pid"] = current_pid
+        save_kde_state(kstate)
+        raw_vol = float(raw_status.get("volume", 0.0))
+        if abs(raw_vol - saved_vol) > 0.2:
+            remote_call("volume", {"value": saved_vol}, wait=True)
+            raw_status["volume"] = saved_vol
+
+    track_raw = raw_status.get("track") or (remote_snap.get("track") if remote_snap else None) or {}
+    title = track_raw.get("title") or ""
+    artist = track_raw.get("artist") or ""
+    album = track_raw.get("album") or ""
+
+    if not artist and " - " in title:
+        parts = title.split(" - ", 1)
+        artist = parts[0].strip()
+        title = parts[1].strip()
+
+    duration = track_raw.get("duration") or raw_status.get("duration") or (remote_snap.get("duration") if remote_snap else 0) or 0
+    seekable = bool(remote_snap.get("seekable")) if remote_snap else (duration > 0 and not track_raw.get("stream", False))
+
+    live_vol = clamp_vol(float(raw_status.get("volume", saved_vol)))
+    if abs(live_vol - saved_vol) > 0.2:
+        kstate["volume_db"] = live_vol
+        if live_vol > -29.5:
+            kstate["pre_mute_volume_db"] = live_vol
+            kstate["muted"] = False
+            is_muted = False
+        save_kde_state(kstate)
+
+    return {
+        "ok": True,
+        "installed": installed,
+        "running": True,
+        "mode": mode,
+        "state": raw_status.get("state", "stopped"),
+        "track": {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "path": track_raw.get("path", ""),
+            "duration": float(duration),
+            "stream": bool(track_raw.get("stream", False)),
+        },
+        "playlist": raw_status.get("playlist", ""),
+        "index": int(raw_status.get("index", -1)),
+        "total": int(raw_status.get("total", 0)),
+        "position": float(raw_status.get("position", 0)),
+        "duration": float(duration),
+        "seekable": seekable,
+        "volume": live_vol,
+        "muted": is_muted or (live_vol <= -29.5),
+        "pre_mute_volume": float(kstate.get("pre_mute_volume_db", 0.0)),
+        "shuffle": bool(raw_status.get("shuffle", False)),
+        "repeat": str(raw_status.get("repeat", "Off")),
+        "mono": bool(raw_status.get("mono", False)),
+        "speed": float(raw_status.get("speed", 1.0)),
+        "eq_preset": str(raw_status.get("eq_preset", "Custom")),
+        "eq_bands": list(raw_status.get("eq_bands", [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
+    }
+
+
+def build_details_snapshot() -> Dict[str, Any]:
+    status = build_status_snapshot()
+    queue_tracks: List[Dict[str, Any]] = []
+    local_playlists: List[Dict[str, Any]] = []
+    providers: List[Dict[str, Any]] = []
+
+    active_keys: Dict[str, Any] = {"cliamp": {}, "radio": {}, "local": {}, "podcast": {}}
+
+    if status["running"]:
+        q_resp = remote_call("queue.list", {"offset": 0, "limit": 100}, wait=True, timeout=3.0)
+        if q_resp and q_resp.get("job", {}).get("result", {}).get("tracks"):
+            raw_tracks = q_resp["job"]["result"]["tracks"]
+            for idx, t in enumerate(raw_tracks):
+                t_idx = t.get("index", idx)
+                t_title = t.get("title") or os.path.basename(t.get("path", f"Track {t_idx + 1}"))
+                t_artist = t.get("artist") or ""
+                if not t_artist and " - " in t_title:
+                    parts = t_title.split(" - ", 1)
+                    t_artist = parts[0].strip()
+                    t_title = parts[1].strip()
+                queue_tracks.append({
+                    "index": t_idx,
+                    "title": t_title,
+                    "artist": t_artist,
+                    "album": t.get("album", ""),
+                    "path": t.get("path", ""),
+                    "stream": bool(t.get("stream", False)),
+                })
+
+        pl_resp = remote_call("provider.playlists", {"provider": "local", "offset": 0, "limit": 50}, wait=True, timeout=3.0)
+        if pl_resp and pl_resp.get("job", {}).get("result", {}).get("playlists"):
+            local_playlists = pl_resp["job"]["result"]["playlists"]
+
+        prov_resp = remote_call("provider.list", None, wait=True, timeout=3.0)
+        if prov_resp and prov_resp.get("job", {}).get("result", {}).get("providers"):
+            active_keys = {p["key"]: p for p in prov_resp["job"]["result"]["providers"]}
+
+    seen = set()
+    for dp in DEFAULT_PROVIDERS:
+        k = dp["key"]
+        seen.add(k)
+        entry = dict(dp)
+        entry["configured"] = k in active_keys
+        providers.append(entry)
+    for k, p in active_keys.items():
+        if k not in seen:
+            providers.append({
+                "key": k,
+                "name": p.get("name", k),
+                "category": "cloud",
+                "icon": "multimedia-player",
+                "description": "Configured music provider",
+                "configured": True,
+            })
+
+    if not local_playlists:
+        local_playlists = get_local_playlists_offline()
+
+    status["queue"] = queue_tracks
+    status["local_playlists"] = local_playlists
+    status["providers"] = providers
+    status["eq_presets"] = EQ_PRESETS
+    return status
+
+
+def start_daemon(extra_args: Optional[List[str]] = None, load_default: bool = True) -> bool:
+    if query_status_raw() is not None:
+        return True
+
+    sock = get_socket_path()
+    proc_info = detect_process_mode()
+    if sock.exists() and not proc_info["pids"]:
+        try:
+            sock.unlink()
+        except OSError:
+            pass
+
+    kstate = load_kde_state()
+    is_muted = bool(kstate.get("muted", False))
+    target_vol = clamp_vol(-30.0 if is_muted else float(kstate.get("volume_db", 0.0)))
+
+    cmd = [get_cliamp_bin(), "--daemon", "--vol", str(target_vol)]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    log_dir = get_config_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "kde-daemon.log"
+
+    try:
+        with open(log_file, "ab") as lf:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=lf,
+                stderr=lf,
+                start_new_session=True,
+            )
+            kstate["last_applied_pid"] = proc.pid
+            save_kde_state(kstate)
+    except Exception:
+        return False
+
+    for _ in range(30):
+        time.sleep(0.1)
+        st = query_status_raw()
+        if st is not None:
+            remote_call("volume", {"value": target_vol}, wait=True)
+            if load_default and not extra_args and st.get("index", -1) == -1:
+                ensure_initial_queue()
+            return True
+    return False
+
+
+def ensure_initial_queue() -> bool:
+    st = query_status_raw()
+    if not st or st.get("index", -1) >= 0:
+        return True
+
+    playlists = get_local_playlists_offline()
+    for preferred in ("Recently Played", "Favorites"):
+        for pl in playlists:
+            if pl["name"] == preferred and pl.get("track_count", 0) > 0:
+                run_cliamp(["load", preferred], timeout=3.0)
+                return True
+
+    for pl in playlists:
+        if pl.get("track_count", 0) > 0:
+            run_cliamp(["load", pl["name"]], timeout=3.0)
+            return True
+
+    resume_file = get_config_dir() / "resume.json"
+    if resume_file.is_file():
+        try:
+            rdata = json.loads(resume_file.read_text(encoding="utf-8"))
+            rpath = rdata.get("path")
+            if rpath:
+                remote_call("url.load", {"path": rpath, "play": False}, wait=True, timeout=4.0)
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def stop_daemon(only_daemon: bool = False) -> bool:
+    proc_info = detect_process_mode()
+    target_pids = proc_info["daemon_pids"] if only_daemon else proc_info["pids"]
+
+    if query_status_raw() is not None and not only_daemon:
+        run_cliamp(["stop"], timeout=2.0)
+
+    for pid in target_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    for _ in range(15):
+        time.sleep(0.1)
+        alive = False
+        for pid in target_pids:
+            if Path(f"/proc/{pid}").exists():
+                alive = True
+        if not alive:
+            break
+
+    for pid in target_pids:
+        if Path(f"/proc/{pid}").exists():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    sock = get_socket_path()
+    if sock.exists() and not detect_process_mode()["pids"]:
+        try:
+            sock.unlink()
+        except OSError:
+            pass
+    return True
+
+
+def launch_in_terminal(cliamp_args: List[str], preferred_terminal: str = "auto") -> bool:
+    cliamp_cmd = [get_cliamp_bin()] + cliamp_args
+    candidates: List[List[str]] = []
+
+    if preferred_terminal and preferred_terminal != "auto":
+        term_bin = shutil.which(preferred_terminal)
+        if term_bin:
+            base = os.path.basename(term_bin)
+            if base in ("konsole", "alacritty", "lxterminal", "xfce4-terminal", "xterm"):
+                candidates.append([term_bin, "-e"] + cliamp_cmd)
+            elif base in ("kitty", "foot", "ghostty"):
+                candidates.append([term_bin] + cliamp_cmd)
+            elif base == "wezterm":
+                candidates.append([term_bin, "start", "--"] + cliamp_cmd)
+            else:
+                candidates.append([term_bin, "-e"] + cliamp_cmd)
+
+    terminal_specs = [
+        ("xdg-terminal-exec", []),
+        ("konsole", ["-e"]),
+        ("kitty", []),
+        ("alacritty", ["-e"]),
+        ("ghostty", ["-e"]),
+        ("wezterm", ["start", "--"]),
+        ("foot", []),
+        ("xfce4-terminal", ["-e"]),
+        ("gnome-terminal", ["--"]),
+        ("xterm", ["-e"]),
+    ]
+    for bin_name, flag_args in terminal_specs:
+        found = shutil.which(bin_name)
+        if found:
+            candidates.append([found] + flag_args + cliamp_cmd)
+
+    if not candidates:
+        return False
+
+    try:
+        subprocess.Popen(
+            candidates[0],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def open_in_terminal(preferred_terminal: str = "auto", provider: str = "") -> bool:
+    proc_info = detect_process_mode()
+    if proc_info["daemon_pids"]:
+        stop_daemon(only_daemon=True)
+
+    kstate = load_kde_state()
+    is_muted = bool(kstate.get("muted", False))
+    target_vol = clamp_vol(-30.0 if is_muted else float(kstate.get("volume_db", 0.0)))
+
+    args = ["--vol", str(target_vol)]
+    if provider:
+        args.extend(["--provider", provider])
+
+    return launch_in_terminal(args, preferred_terminal)
+
+
+def open_setup_in_terminal(preferred_terminal: str = "auto") -> bool:
+    return launch_in_terminal(["setup"], preferred_terminal)
+
+
+def ensure_playing_ready() -> None:
+    st = query_status_raw()
+    if st is None:
+        start_daemon(load_default=True)
+        st = query_status_raw()
+    if st and st.get("index", -1) == -1:
+        ensure_initial_queue()
+
+
+def get_provider_playlists(provider: str) -> Dict[str, Any]:
+    if query_status_raw() is None:
+        if provider == "local":
+            return {"ok": True, "provider": provider, "playlists": get_local_playlists_offline()}
+        start_daemon(load_default=False)
+
+    resp = remote_call("provider.playlists", {"provider": provider, "offset": 0, "limit": 50}, wait=True, timeout=6.0)
+    if resp and resp.get("job", {}).get("result", {}).get("playlists"):
+        return {
+            "ok": True,
+            "provider": provider,
+            "playlists": resp["job"]["result"]["playlists"],
+        }
+    return {"ok": False, "provider": provider, "playlists": []}
+
+
+def set_volume_persistent(new_vol: float) -> None:
+    clamped = clamp_vol(new_vol)
+    kstate = load_kde_state()
+    kstate["volume_db"] = clamped
+    if clamped > -29.5:
+        kstate["pre_mute_volume_db"] = clamped
+        kstate["muted"] = False
+    else:
+        kstate["muted"] = True
+    save_kde_state(kstate)
+
+    if query_status_raw() is not None:
+        remote_call("volume", {"value": clamped}, wait=True)
+
+
+def step_volume_persistent(delta: float) -> None:
+    kstate = load_kde_state()
+    st = query_status_raw()
+    current_vol = float(st.get("volume", kstate.get("volume_db", 0.0))) if st else float(kstate.get("volume_db", 0.0))
+    if kstate.get("muted") and delta > 0:
+        base = float(kstate.get("pre_mute_volume_db", 0.0))
+        set_volume_persistent(base + delta)
+    else:
+        set_volume_persistent(current_vol + delta)
+
+
+def toggle_mute_persistent() -> None:
+    kstate = load_kde_state()
+    st = query_status_raw()
+    live_vol = float(st.get("volume", kstate.get("volume_db", 0.0))) if st else float(kstate.get("volume_db", 0.0))
+    currently_muted = bool(kstate.get("muted", False)) or (live_vol <= -29.5)
+
+    if currently_muted:
+        restore_vol = clamp_vol(float(kstate.get("pre_mute_volume_db", 0.0)))
+        if restore_vol <= -29.5:
+            restore_vol = 0.0
+        kstate["muted"] = False
+        kstate["volume_db"] = restore_vol
+        save_kde_state(kstate)
+        if st is not None:
+            remote_call("volume", {"value": restore_vol}, wait=True)
+    else:
+        kstate["pre_mute_volume_db"] = clamp_vol(live_vol)
+        kstate["muted"] = True
+        kstate["volume_db"] = -30.0
+        save_kde_state(kstate)
+        if st is not None:
+            remote_call("volume", {"value": -30.0}, wait=True)
+
+
+def reset_all_settings() -> None:
+    if query_status_raw() is not None:
+        remote_call("volume", {"value": 0.0}, wait=True)
+        run_cliamp(["eq", "Flat"], timeout=1.5)
+
+    for f in (get_kde_state_path(), get_config_dir() / "kde-daemon.log"):
+        try:
+            if f.exists():
+                f.unlink()
+        except OSError:
+            pass
+
+    cfg_path = get_config_dir() / "config.toml"
+    if cfg_path.is_file():
+        try:
+            lines = cfg_path.read_text(encoding="utf-8").splitlines()
+            cleaned = [ln for ln in lines if not re.match(r"^\s*(theme|visualizer)\s*=", ln)]
+            content = "\n".join(cleaned).strip()
+            if content:
+                cfg_path.write_text(content + "\n", encoding="utf-8")
+            else:
+                cfg_path.unlink()
+        except Exception:
+            pass
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd == "status":
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd in ("details", "full-info"):
+        print(json.dumps(build_details_snapshot()))
+        return 0
+
+    if cmd == "provider-playlists":
+        provider = args[0] if args else "local"
+        print(json.dumps(get_provider_playlists(provider)))
+        return 0
+
+    if cmd == "start-daemon":
+        start_daemon(args, load_default=True)
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "stop-daemon":
+        stop_daemon(only_daemon=False)
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "toggle-daemon":
+        if query_status_raw() is not None:
+            stop_daemon(only_daemon=False)
+        else:
+            start_daemon(load_default=True)
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "open-terminal":
+        pref_term = args[0] if len(args) >= 1 else "auto"
+        prov = args[1] if len(args) >= 2 else ""
+        open_in_terminal(pref_term, prov)
+        time.sleep(0.4)
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "open-setup":
+        pref_term = args[0] if len(args) >= 1 else "auto"
+        open_setup_in_terminal(pref_term)
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "toggle":
+        st = query_status_raw()
+        if st is None:
+            start_daemon(load_default=True)
+            ensure_initial_queue()
+            run_cliamp(["play"])
+        else:
+            if st.get("index", -1) == -1:
+                ensure_initial_queue()
+                run_cliamp(["play"])
+            else:
+                run_cliamp(["toggle"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "play":
+        ensure_playing_ready()
+        run_cliamp(["play"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "pause":
+        if query_status_raw() is not None:
+            run_cliamp(["pause"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "stop":
+        if query_status_raw() is not None:
+            run_cliamp(["stop"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "next":
+        ensure_playing_ready()
+        run_cliamp(["next"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "prev":
+        ensure_playing_ready()
+        run_cliamp(["prev"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "play-index":
+        if args:
+            ensure_playing_ready()
+            try:
+                idx = int(args[0])
+                remote_call("queue.play", {"index": idx}, wait=True)
+            except ValueError:
+                pass
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "load-playlist":
+        if args:
+            pl_name = args[0]
+            if query_status_raw() is None:
+                start_daemon(["--playlist", pl_name, "--auto-play"], load_default=False)
+            else:
+                run_cliamp(["load", pl_name])
+                run_cliamp(["play"])
+        print(json.dumps(build_details_snapshot()))
+        return 0
+
+    if cmd == "load-provider":
+        provider = args[0] if len(args) >= 1 else "cliamp"
+        playlist_id = args[1] if len(args) >= 2 else ""
+        if playlist_id:
+            if query_status_raw() is None:
+                start_daemon(load_default=False)
+            remote_call("provider.load", {"provider": provider, "playlist": playlist_id}, wait=True, timeout=8.0)
+            run_cliamp(["play"])
+        else:
+            if query_status_raw() is not None:
+                p_info = get_provider_playlists(provider)
+                pls = p_info.get("playlists", [])
+                if pls:
+                    first_id = pls[0].get("id") or pls[0].get("name")
+                    if first_id:
+                        remote_call("provider.load", {"provider": provider, "playlist": first_id}, wait=True, timeout=8.0)
+                        run_cliamp(["play"])
+                        print(json.dumps(build_details_snapshot()))
+                        return 0
+            stop_daemon(only_daemon=True)
+            start_daemon(["--provider", provider, "--auto-play"], load_default=False)
+        print(json.dumps(build_details_snapshot()))
+        return 0
+
+    if cmd == "load-url":
+        if args:
+            url = args[0]
+            if query_status_raw() is None:
+                start_daemon(load_default=False)
+            remote_call("url.load", {"path": url, "play": True}, wait=True, timeout=10.0)
+        print(json.dumps(build_details_snapshot()))
+        return 0
+
+    if cmd == "volume":
+        if args:
+            try:
+                set_volume_persistent(float(args[0]))
+            except ValueError:
+                pass
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "volume-step":
+        if args:
+            try:
+                step_volume_persistent(float(args[0]))
+            except ValueError:
+                pass
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "toggle-mute":
+        toggle_mute_persistent()
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "seek":
+        if args and query_status_raw() is not None:
+            try:
+                offset = float(args[0])
+                remote_call("seek", {"value": offset}, wait=True)
+            except ValueError:
+                pass
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "seek-abs":
+        if args and query_status_raw() is not None:
+            try:
+                pos = float(args[0])
+                remote_call("seek.absolute", {"value": pos}, wait=True)
+            except ValueError:
+                pass
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "shuffle":
+        if query_status_raw() is not None:
+            mode = args[0] if args else ""
+            if mode:
+                run_cliamp(["shuffle", mode])
+            else:
+                run_cliamp(["shuffle"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "repeat":
+        if query_status_raw() is not None:
+            mode = args[0] if args else ""
+            if mode:
+                run_cliamp(["repeat", mode])
+            else:
+                run_cliamp(["repeat"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "mono":
+        if query_status_raw() is not None:
+            mode = args[0] if args else ""
+            if mode:
+                run_cliamp(["mono", mode])
+            else:
+                run_cliamp(["mono"])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "speed":
+        if args and query_status_raw() is not None:
+            run_cliamp(["speed", args[0]])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "eq":
+        if args and query_status_raw() is not None:
+            preset = " ".join(args)
+            run_cliamp(["eq", preset])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "eq-band":
+        if len(args) >= 2 and query_status_raw() is not None:
+            band = args[0]
+            db = args[1]
+            run_cliamp(["eq", "--band", str(band), str(db)])
+        print(json.dumps(build_status_snapshot()))
+        return 0
+
+    if cmd == "reset-settings":
+        reset_all_settings()
+        print(json.dumps({"ok": True, "reset": True}))
+        return 0
+
+    print(json.dumps(build_status_snapshot()))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

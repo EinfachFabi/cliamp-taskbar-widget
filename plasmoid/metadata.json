@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Fabi"
+            }
+        ],
+        "Category": "Multimedia",
+        "Description": "Control the cliamp retro terminal music player directly from the KDE Plasma taskbar (Daemon, Live Visualizer, Playlists, Cloud & Radio Sources, 10-Band EQ & Themes)",
+        "Icon": "cliamp",
+        "Id": "org.kde.plasma.cliamp",
+        "License": "MIT",
+        "Name": "cliamp Controller",
+        "Version": "1.2.0",
+        "Website": "https://github.com/bjarneo/cliamp"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="pollInterval" type="Int">
+      <default>1000</default>
+    </entry>
+    <entry name="showTrackInPanel" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="panelTrackMaxWidth" type="Int">
+      <default>180</default>
+    </entry>
+    <entry name="showPanelControls" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="volumeStepDb" type="Double">
+      <default>1.5</default>
+    </entry>
+    <entry name="preferredTerminal" type="String">
+      <default>auto</default>
+    </entry>
+    <entry name="defaultProvider" type="String">
+      <default>cliamp</default>
+    </entry>
+  </group>
+</kcfg>
