@@ -1,4 +1,4 @@
-# cliamp-kde — Native KDE Plasma Taskbar Integration for `cliamp`
+# cliamp-taskbar-widget — Native KDE Plasma Taskbar Integration for `cliamp`
 
 [![KDE Plasma 6](https://img.shields.io/badge/KDE_Plasma-6.0%2B%20%7C%205.27%2B-1d99f3?logo=kde&logoColor=white)](https://kde.org/plasma-desktop/)
 [![cliamp](https://img.shields.io/badge/cliamp-v2.0%2B-f9e2af)](https://github.com/bjarneo/cliamp)
@@ -35,8 +35,8 @@ Supports both **KDE Plasma 6** and **KDE Plasma 5** across all major Linux distr
 The included [`install.sh`](install.sh) script automatically detects your Linux distribution and KDE Plasma version (Plasma 6 or Plasma 5). If `cliamp` is not yet installed, it will automatically install it for you.
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/cliamp-kde.git
-cd cliamp-kde
+git clone https://github.com/EinfachFabi/cliamp-taskbar-widget.git
+cd cliamp-taskbar-widget
 ./install.sh
 ```
 

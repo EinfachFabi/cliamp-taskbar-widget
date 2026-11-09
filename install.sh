@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# cliamp-kde — Cross-Distro Installer for the cliamp KDE Plasma Taskbar Widget
+# cliamp-taskbar-widget — Cross-Distro Installer for the cliamp KDE Plasma Taskbar Widget
 # Supports: Arch/Manjaro/CachyOS, Debian/Ubuntu/Kubuntu/KDE Neon, Fedora/Nobara,
 #           openSUSE Tumbleweed/Leap, Void, and generic Linux systems with KDE.
 # ==============================================================================

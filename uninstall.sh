@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# cliamp-kde — Uninstaller
+# cliamp-taskbar-widget — Uninstaller
 # Removes the KDE Plasma Widget, helper script, icon, systemd service,
 # and resets all saved cliamp-kde & widget settings back to defaults.
 # ==============================================================================
